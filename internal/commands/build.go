@@ -26,6 +26,7 @@ type buildOptions struct {
 	noCache  bool
 	progress string
 	pull     bool
+	tag      string
 }
 
 func buildCmd(dockerCli command.Cli) *cobra.Command {
@@ -44,12 +45,14 @@ func buildCmd(dockerCli command.Cli) *cobra.Command {
 	flags.BoolVar(&opts.noCache, "no-cache", false, "Do not use cache when building the image")
 	flags.StringVar(&opts.progress, "progress", "auto", "Set type of progress output (auto, plain, tty). Use plain to show container output")
 	flags.BoolVar(&opts.pull, "pull", false, "Always attempt to pull a newer version of the image")
+	cmd.Flags().StringVarP(&opts.tag, "tag", "t", "", "Name and optionally a tag in the 'name:tag' format")
 
 	return cmd
 }
 
 func runBuild(dockerCli command.Cli, application string, opt buildOptions) error {
-	f := application + "/" + internal.ComposeFileName
+	appname := internal.DirNameFromAppName(application)
+	f := "./" + appname + "/" + internal.ComposeFileName
 	if _, err := os.Stat(f); err != nil {
 		if os.IsNotExist(errors.Cause(err)) {
 			return fmt.Errorf("no compose file at %s, did you selected the right docker app folder ?", f)
@@ -63,7 +66,9 @@ func runBuild(dockerCli command.Cli, application string, opt buildOptions) error
 	}
 	for k, t := range cfg.Target {
 		if strings.HasPrefix(*t.Context, ".") {
-			path, err := filepath.Abs(application + "/" + (*t.Context)[1:])
+			// Relative path in compose file under x.dockerapp refers to parent folder
+			// FIXME docker app init should maybe udate them ?
+			path, err := filepath.Abs(appname + "/../" + (*t.Context)[1:])
 			if err != nil {
 				return err
 			}
@@ -90,8 +95,33 @@ func runBuild(dockerCli command.Cli, application string, opt buildOptions) error
 		},
 	}
 
-	_, err = build.Build(ctx, driverInfo, buildopts, dockerAPI(dockerCli), dockerCli.ConfigFile(), pw)
-	return err
+	resp, err := build.Build(ctx, driverInfo, buildopts, dockerAPI(dockerCli), dockerCli.ConfigFile(), pw)
+	if err != nil {
+		return err
+	}
+
+	bundle, err := makeBundle(dockerCli, application, nil)
+	if err != nil {
+		return err
+	}
+
+	for k, r := range resp {
+		image := bundle.Images[k]
+		// FIXME this is dockerd digest, not OCI compliant
+		image.Digest = r.ExporterResponse["containerimage.digest"]
+		bundle.Images[k] = image
+	}
+
+	ref, err := getNamedTagged(opt.tag)
+	if err != nil {
+		return err
+	}
+
+	if err := persistInBundleStore(ref, bundle); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 /// FIXME copy from vendor/github.com/docker/buildx/commands/util.go:318 could probably be made public
