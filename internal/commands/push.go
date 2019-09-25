@@ -3,11 +3,15 @@ package commands
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/docker/cli/cli/streams"
+	"github.com/docker/distribution/manifest/schema2"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
+
+	"github.com/opencontainers/go-digest"
 
 	"github.com/containerd/containerd/platforms"
 	"github.com/deislabs/cnab-go/bundle"
@@ -42,7 +46,6 @@ const ( // Docker specific annotations and values
 )
 
 type pushOptions struct {
-	tag          string
 	platforms    []string
 	allPlatforms bool
 }
@@ -50,90 +53,161 @@ type pushOptions struct {
 func pushCmd(dockerCli command.Cli) *cobra.Command {
 	var opts pushOptions
 	cmd := &cobra.Command{
-		Use:     "push [APP_NAME] --tag TARGET_REFERENCE [OPTIONS]",
-		Short:   "Push an application package to a registry",
-		Example: `$ docker app push myapp --tag myrepo/myapp:mytag`,
-		Args:    cli.RequiresMaxArgs(1),
+		Use:     "push [APP_TAG] [OPTIONS]",
+		Short:   "Push an application to a registry",
+		Example: `$ docker app push myrepo/myapp:mytag`,
+		Args:    cli.ExactArgs(1),
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			return checkFlags(cmd.Flags(), opts)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPush(dockerCli, firstOrEmpty(args), opts)
+			return runPush(dockerCli, args[0], opts)
 		},
 	}
 	flags := cmd.Flags()
-	flags.StringVarP(&opts.tag, "tag", "t", "", "Target registry reference (default: <name>:<version> from metadata)")
 	flags.StringSliceVar(&opts.platforms, "platform", []string{"linux/amd64"}, "For multi-arch service images, push the specified platforms")
 	flags.BoolVar(&opts.allPlatforms, "all-platforms", false, "If present, push all platforms")
 	return cmd
 }
 
-func runPush(dockerCli command.Cli, name string, opts pushOptions) error {
-	defer muteDockerCli(dockerCli)()
-	// Get the bundle
-	bndl, ref, err := resolveReferenceAndBundle(dockerCli, name)
+func runPush(dockerCli command.Cli, ref string, opts pushOptions) error {
+	named, err := reference.ParseNormalizedNamed(ref)
 	if err != nil {
 		return err
 	}
-	// Retag invocation image if needed
-	retag, err := shouldRetagInvocationImage(metadata.FromBundle(bndl), bndl, opts.tag, ref)
-	if err != nil {
-		return err
-	}
-	if retag.shouldRetag {
-		logrus.Debugf(`Retagging invocation image "%q"`, retag.invocationImageRef.String())
-		if err := retagInvocationImage(dockerCli, bndl, retag.invocationImageRef.String()); err != nil {
-			return err
-		}
-	}
-	// Push the invocation image
-	if err := pushInvocationImage(dockerCli, retag); err != nil {
-		return err
-	}
-	// Push the bundle
-	return pushBundle(dockerCli, opts, bndl, retag)
-}
+	named = reference.TagNameOnly(named)
+	repo := fmt.Sprintf("%s/%s", reference.Domain(named), reference.Path(named))
 
-func resolveReferenceAndBundle(dockerCli command.Cli, name string) (*bundle.Bundle, string, error) {
+	// Get the bundle
 	bundleStore, err := prepareBundleStore()
 	if err != nil {
-		return nil, "", err
+		return err
 	}
 
-	bndl, ref, err := resolveBundle(dockerCli, bundleStore, name, false)
-	if err != nil {
-		return nil, "", err
-	}
-	if err := bndl.Validate(); err != nil {
-		return nil, "", err
-	}
-	return bndl, ref, err
-}
-
-func pushInvocationImage(dockerCli command.Cli, retag retagResult) error {
-	logrus.Debugf("Pushing the invocation image %q", retag.invocationImageRef)
-	repoInfo, err := registry.ParseRepositoryInfo(retag.invocationImageRef)
+	bndl, err := bundleStore.Read(named)
 	if err != nil {
 		return err
 	}
-	encodedAuth, err := command.EncodeAuthToBase64(command.ResolveAuthConfig(context.Background(), dockerCli, repoInfo.Index))
-	if err != nil {
+
+	// Push the service images
+	for service, image := range bndl.Images {
+		fmt.Fprintf(dockerCli.Out(), "Pushing service image '%s'\n", service)
+		digest, err := push(dockerCli, image.BaseImage, named, opts)
+		if err != nil {
+			return err
+		}
+		image.Image = fmt.Sprintf("%s@%s", repo, digest.String())
+		image.MediaType = schema2.MediaTypeManifest
+		bndl.Images[service] = image
+	}
+
+	// Push the invocation images
+	for i, image := range bndl.InvocationImages {
+		fmt.Fprintf(dockerCli.Out(), "Pushing invocation image\n")
+		digest, err := push(dockerCli, image.BaseImage, named, opts)
+		if err != nil {
+			return err
+		}
+		image.MediaType = schema2.MediaTypeManifest
+		image.Image = fmt.Sprintf("%s@%s", repo, digest.String())
+		bndl.InvocationImages[i] = image
+	}
+
+	// Push the bundle
+	fmt.Fprintf(dockerCli.Out(), "Pushing bundle\n")
+	if err = pushBundle(dockerCli, opts, bndl, named); err != nil {
 		return err
 	}
-	reader, err := dockerCli.Client().ImagePush(context.Background(), retag.invocationImageRef.String(), types.ImagePushOptions{
-		RegistryAuth: encodedAuth,
-	})
-	if err != nil {
-		return errors.Wrapf(err, "starting push of %q", retag.invocationImageRef.String())
+
+	if err := persistInBundleStore(named, bndl); err != nil {
+		return err
 	}
-	defer reader.Close()
-	if err := jsonmessage.DisplayJSONMessagesStream(reader, ioutil.Discard, 0, false, nil); err != nil {
-		return errors.Wrapf(err, "pushing to %q", retag.invocationImageRef.String())
-	}
+
 	return nil
 }
 
-func pushBundle(dockerCli command.Cli, opts pushOptions, bndl *bundle.Bundle, retag retagResult) error {
+func push(dockerCli command.Cli, image bundle.BaseImage, named reference.Named, opts pushOptions) (digest.Digest, error) {
+	ref := image.Digest
+	if ref == "" {
+		ref = image.Image
+	}
+	// FIXME if bundle define image by Addressable Digest (foo@sha256:...), check registry already has it then skip tag&push
+	if err := dockerCli.Client().ImageTag(context.Background(), ref, named.String()); err != nil {
+		return "", err
+	}
+	digest, err := pushImage(dockerCli, opts, named)
+	if err != nil {
+		return "", err
+	}
+	return digest, nil
+}
+
+func pushImage(dockerCli command.Cli, opts pushOptions, ref reference.Named) (digest.Digest, error) {
+	logrus.Debugf("Pushing image %q", ref.String())
+	repoInfo, err := registry.ParseRepositoryInfo(ref)
+	if err != nil {
+		return "", err
+	}
+	encodedAuth, err := command.EncodeAuthToBase64(command.ResolveAuthConfig(context.Background(), dockerCli, repoInfo.Index))
+	if err != nil {
+		return "", err
+	}
+	reader, err := dockerCli.Client().ImagePush(context.Background(), ref.String(), types.ImagePushOptions{
+		RegistryAuth: encodedAuth,
+	})
+	if err != nil {
+		return "", errors.Wrapf(err, "starting push of %q", ref.String())
+	}
+	defer reader.Close()
+	d := digestCollector{out:dockerCli.Out()}
+	if err := jsonmessage.DisplayJSONMessagesToStream(reader, &d, nil); err != nil {
+		return "", errors.Wrapf(err, "pushing to %q", ref.String())
+	}
+
+	// First attempt : retrieve the registry digest from push stdout
+	// FIXME wonder there's a better way, or maybe we could reuse some existing code for this purpose
+	dg, err := d.Digest()
+	if err == nil && dg != "" {
+		return dg, nil
+	}
+
+	// Second attempt: query registry for the tag we just pushed
+	// FIXME potential race condition
+	t, err := dockerCli.RegistryClient(false).GetManifest(context.TODO(), ref)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to retrieve image digest %s", ref.String())
+	}
+	return t.Descriptor.Digest, nil
+}
+
+type digestCollector struct {
+	out *streams.Out
+	last string
+}
+
+// Write implement writer.Write
+func (d *digestCollector) Write(p []byte) (n int, err error) {
+	d.last = string(p)
+	return d.out.Write(p)
+}
+
+// Digest return the image digest collected by parsing "docker push" stdout
+func (d digestCollector) Digest() (digest.Digest, error) {
+	dg := digest.DigestRegexp.FindString(d.last)
+	return digest.Parse(dg)
+}
+
+// FD implement stream.FD
+func (d *digestCollector) FD() uintptr {
+	return d.out.FD()
+}
+
+// IsTerminal implement stream.IsTerminal
+func (d *digestCollector) IsTerminal() bool {
+	return d.out.IsTerminal()
+}
+
+func pushBundle(dockerCli command.Cli, opts pushOptions, bndl *bundle.Bundle, tag reference.Named) error {
 	insecureRegistries, err := insecureRegistriesFromEngine(dockerCli)
 	if err != nil {
 		return errors.Wrap(err, "could not retrive insecure registries")
@@ -149,17 +223,17 @@ func pushBundle(dockerCli command.Cli, opts pushOptions, bndl *bundle.Bundle, re
 	if platforms := platformFilter(opts); len(platforms) > 0 {
 		fixupOptions = append(fixupOptions, remotes.WithComponentImagePlatforms(platforms))
 	}
-	// bundle fixup
-	if err := remotes.FixupBundle(context.Background(), bndl, retag.cnabRef, resolver, fixupOptions...); err != nil {
-		return errors.Wrapf(err, "fixing up %q for push", retag.cnabRef)
+	if logrus.IsLevelEnabled(logrus.DebugLevel) {
+		bt, _ := json.MarshalIndent(bndl, "> ", "  ")
+		fmt.Println(string(bt))
 	}
 	// push bundle manifest
-	logrus.Debugf("Pushing the bundle %q", retag.cnabRef)
-	descriptor, err := remotes.Push(log.WithLogContext(context.Background()), bndl, retag.cnabRef, resolver, true, withAppAnnotations)
+	logrus.Debugf("Pushing the bundle %q", tag)
+	descriptor, err := remotes.Push(log.WithLogContext(context.Background()), bndl, tag, resolver, true, withAppAnnotations)
 	if err != nil {
-		return errors.Wrapf(err, "pushing to %q", retag.cnabRef)
+		return errors.Wrapf(err, "pushing to %q", tag)
 	}
-	fmt.Fprintf(os.Stdout, "Successfully pushed bundle to %s. Digest is %s.\n", retag.cnabRef.String(), descriptor.Digest)
+	fmt.Fprintf(os.Stdout, "Successfully pushed bundle to %s. Digest is %s.\n", tag.String(), descriptor.Digest)
 	return nil
 }
 

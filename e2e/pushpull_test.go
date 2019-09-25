@@ -95,10 +95,14 @@ func TestPushArchs(t *testing.T) {
 			t.Run(testCase.name, func(t *testing.T) {
 				cmd := info.configuredCmd
 				ref := info.registryAddress + "/test/push-pull:1"
-				args := []string{"app", "push", "--tag", ref}
+
+				args := []string{"app", "build", "--tag", ref}
 				args = append(args, testCase.args...)
 				args = append(args, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
 				cmd.Command = dockerCli.Command(args...)
+				icmd.RunCmd(cmd).Assert(t, icmd.Success)
+
+				cmd.Command = dockerCli.Command("app", "push", ref)
 				icmd.RunCmd(cmd).Assert(t, icmd.Success)
 
 				var index v1.Index
@@ -128,11 +132,15 @@ func TestPushInsecureRegistry(t *testing.T) {
 		// create a command outside of the dind context so without the insecure registry configured
 		cmd2, cleanup2 := dockerCli.createTestCmd()
 		defer cleanup2()
-		cmd2.Command = dockerCli.Command("app", "push", "--tag", ref, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
+		cmd2.Command = dockerCli.Command("app", "build", "--tag", ref, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
+		icmd.RunCmd(cmd2).Assert(t, icmd.Success)
+		cmd2.Command = dockerCli.Command("app", "push", ref)
 		icmd.RunCmd(cmd2).Assert(t, icmd.Expected{ExitCode: 1})
 
 		// run the push with the command inside dind context configured to allow access to the insecure registry
 		cmd := info.configuredCmd
+		cmd2.Command = dockerCli.Command("app", "build", "--tag", ref, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
+		icmd.RunCmd(cmd2).Assert(t, icmd.Success)
 		cmd.Command = dockerCli.Command("app", "push", "--tag", ref, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
 		icmd.RunCmd(cmd).Assert(t, icmd.Success)
 	})
@@ -142,7 +150,9 @@ func TestPushInstall(t *testing.T) {
 	runWithDindSwarmAndRegistry(t, func(info dindSwarmAndRegistryInfo) {
 		cmd := info.configuredCmd
 		ref := info.registryAddress + "/test/push-pull"
-		cmd.Command = dockerCli.Command("app", "push", "--tag", ref, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
+		cmd.Command = dockerCli.Command("app", "build", "--tag", ref, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
+		icmd.RunCmd(cmd).Assert(t, icmd.Success)
+		cmd.Command = dockerCli.Command("app", "push", ref)
 		icmd.RunCmd(cmd).Assert(t, icmd.Success)
 
 		cmd.Command = dockerCli.Command("app", "install", ref, "--name", t.Name())
@@ -157,7 +167,11 @@ func TestPushPullInstall(t *testing.T) {
 		cmd := info.configuredCmd
 		ref := info.registryAddress + "/test/push-pull"
 		tag := ":v.0.0.1"
-		cmd.Command = dockerCli.Command("app", "push", "--tag", ref+tag, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
+
+		cmd.Command = dockerCli.Command("app", "build", "--tag", ref+tag, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
+		icmd.RunCmd(cmd).Assert(t, icmd.Success)
+
+		cmd.Command = dockerCli.Command("app", "push", ref+tag)
 		icmd.RunCmd(cmd).Assert(t, icmd.Success)
 		cmd.Command = dockerCli.Command("app", "pull", ref+tag)
 		icmd.RunCmd(cmd).Assert(t, icmd.Success)
@@ -193,8 +207,10 @@ func TestPushInstallBundle(t *testing.T) {
 		defer tmpDir.Remove()
 		bundleFile := tmpDir.Join("bundle.json")
 
-		// render the app to a bundle, we use the app from the push pull test above.
-		cmd.Command = dockerCli.Command("app", "bundle", "-o", bundleFile, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
+		cmd.Command = dockerCli.Command("app", "build", "-o", bundleFile, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
+		icmd.RunCmd(cmd).Assert(t, icmd.Success)
+
+		cmd.Command = dockerCli.Command("pull", "busybox:1.30.1")
 		icmd.RunCmd(cmd).Assert(t, icmd.Success)
 
 		// push it and install to check it is available
@@ -220,7 +236,7 @@ func TestPushInstallBundle(t *testing.T) {
 		t.Run("push-ref", func(t *testing.T) {
 			name := strings.Replace(t.Name(), "/", "_", 1)
 			ref2 := info.registryAddress + "/test/push-ref"
-			cmd.Command = dockerCli.Command("app", "push", "--tag", ref2, ref+":latest")
+			cmd.Command = dockerCli.Command("app", "push", ref2)
 			icmd.RunCmd(cmd).Assert(t, icmd.Success)
 
 			cmd.Command = dockerCli.Command("app", "install", ref2, "--name", name)
@@ -242,7 +258,7 @@ func TestPushInstallBundle(t *testing.T) {
 			cmd2.Env = append(cmd2.Env, "DOCKER_CONTEXT=swarm-context")
 
 			// bundle the app again but this time with a tag to store it into the bundle store
-			cmd2.Command = dockerCli.Command("app", "bundle", "--tag", ref2, "-o", bundleFile, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
+			cmd2.Command = dockerCli.Command("app", "build", "--tag", ref2, "-o", bundleFile, filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
 			icmd.RunCmd(cmd2).Assert(t, icmd.Success)
 			// Push the app without tagging it explicitly
 			cmd2.Command = dockerCli.Command("app", "push", ref2)

@@ -22,10 +22,13 @@ b-simple-app           latest simple
 
 func insertBundles(t *testing.T, cmd icmd.Cmd, dir *fs.Dir, info dindSwarmAndRegistryInfo) string {
 	// Push an application so that we can later pull it by digest
-	cmd.Command = dockerCli.Command("app", "push", "--tag", info.registryAddress+"/c-myapp", filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
+	cmd.Command = dockerCli.Command("app", "build", "--tag", info.registryAddress+"/c-myapp", filepath.Join("testdata", "push-pull", "push-pull.dockerapp"))
 	r := icmd.RunCmd(cmd).Assert(t, icmd.Success)
 
-	// Get the digest from the output of the pull command
+	cmd.Command = dockerCli.Command("app", "push", info.registryAddress+"/c-myapp")
+	icmd.RunCmd(cmd).Assert(t, icmd.Success)
+
+	// Get the digest from the output of the push command
 	out := r.Stdout()
 	matches := reg.FindAllStringSubmatch(out, 1)
 	digest := matches[0][1]
@@ -34,9 +37,9 @@ func insertBundles(t *testing.T, cmd icmd.Cmd, dir *fs.Dir, info dindSwarmAndReg
 	cmd.Command = dockerCli.Command("app", "pull", info.registryAddress+"/c-myapp@"+digest)
 	icmd.RunCmd(cmd).Assert(t, icmd.Success)
 
-	cmd.Command = dockerCli.Command("app", "bundle", filepath.Join("testdata", "simple", "simple.dockerapp"), "--tag", "b-simple-app", "--output", dir.Join("simple-bundle.json"))
+	cmd.Command = dockerCli.Command("app", "build", filepath.Join("testdata", "simple", "simple.dockerapp"), "--tag", "b-simple-app")
 	icmd.RunCmd(cmd).Assert(t, icmd.Success)
-	cmd.Command = dockerCli.Command("app", "bundle", filepath.Join("testdata", "simple", "simple.dockerapp"), "--tag", "a-simple-app", "--output", dir.Join("simple-bundle.json"))
+	cmd.Command = dockerCli.Command("app", "build", filepath.Join("testdata", "simple", "simple.dockerapp"), "--tag", "a-simple-app")
 	icmd.RunCmd(cmd).Assert(t, icmd.Success)
 
 	return digest
@@ -66,10 +69,23 @@ func TestImageRm(t *testing.T) {
 		digest := insertBundles(t, cmd, dir, info)
 
 		cmd.Command = dockerCli.Command("app", "image", "rm", info.registryAddress+"/c-myapp@"+digest)
-		icmd.RunCmd(cmd).Assert(t, icmd.Success)
+		icmd.RunCmd(cmd).Assert(t, icmd.Expected{
+			ExitCode: 0,
+			Out:      "Deleted: " + info.registryAddress + "/c-myapp@" + digest,
+		})
 
-		cmd.Command = dockerCli.Command("app", "image", "rm", "a-simple-app:latest", "b-simple-app:latest")
-		icmd.RunCmd(cmd).Assert(t, icmd.Success)
+		cmd.Command = dockerCli.Command("app", "image", "rm", "a-simple-app", "b-simple-app:latest")
+		icmd.RunCmd(cmd).Assert(t, icmd.Expected{
+			ExitCode: 0,
+			Out: `Deleted: a-simple-app:latest
+Deleted: b-simple-app:latest`,
+		})
+
+		cmd.Command = dockerCli.Command("app", "image", "rm", "b-simple-app")
+		icmd.RunCmd(cmd).Assert(t, icmd.Expected{
+			ExitCode: 1,
+			Err:      `Error: no such image b-simple-app:latest`,
+		})
 
 		expectedOutput := "REPOSITORY TAG APP NAME\n"
 		cmd.Command = dockerCli.Command("app", "image", "ls")
